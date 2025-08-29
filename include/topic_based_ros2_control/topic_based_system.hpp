@@ -34,6 +34,7 @@
 
 // C++
 #include <memory>
+#include <mutex>
 #include <string>
 
 // ROS
@@ -66,6 +67,7 @@ public:
   hardware_interface::return_type write(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) override;
 
 private:
+  std::mutex joint_state_mutex_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr topic_based_joint_states_subscriber_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr topic_based_joint_commands_publisher_;
   rclcpp::Node::SharedPtr node_;

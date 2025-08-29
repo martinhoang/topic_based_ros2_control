@@ -149,7 +149,10 @@ CallbackReturn TopicBasedSystem::on_init(const hardware_interface::HardwareInfo&
       get_hardware_parameter("joint_commands_topic", "/robot_joint_commands"), rclcpp::QoS(1));
   topic_based_joint_states_subscriber_ = node_->create_subscription<sensor_msgs::msg::JointState>(
       get_hardware_parameter("joint_states_topic", "/robot_joint_states"), rclcpp::SensorDataQoS(),
-      [this](const sensor_msgs::msg::JointState::SharedPtr joint_state) { latest_joint_state_ = *joint_state; });
+      [this](const sensor_msgs::msg::JointState::SharedPtr joint_state) { 
+        std::scoped_lock<std::mutex> lock(joint_state_mutex_);
+        latest_joint_state_ = *joint_state; 
+      });
 
   // if the values on the `joint_states_topic` are wrapped between -2*pi and 2*pi (like they are in Isaac Sim)
   // sum the total joint rotation returned on the `joint_states_` interface
@@ -209,30 +212,40 @@ hardware_interface::return_type TopicBasedSystem::read(const rclcpp::Time& /*tim
     rclcpp::spin_some(node_);
   }
 
-  for (std::size_t i = 0; i < latest_joint_state_.name.size(); ++i)
+  // Create a local copy of the joint state data while holding the lock
+  sensor_msgs::msg::JointState joint_state_copy;
+  {
+      std::scoped_lock<std::mutex> lock(joint_state_mutex_); // <--- ADD LOCK
+      joint_state_copy = latest_joint_state_;
+  } // Mutex is automatically unlocked here
+
+  for (std::size_t i = 0; i < joint_state_copy.name.size(); ++i)
   {
     const auto& joints = info_.joints;
     auto it = std::find_if(joints.begin(), joints.end(),
-                           [&joint_name = std::as_const(latest_joint_state_.name[i])](
+                           [&joint_name = std::as_const(joint_state_copy.name[i])](
                                const hardware_interface::ComponentInfo& info) { return joint_name == info.name; });
     if (it != joints.end())
     {
       auto j = static_cast<std::size_t>(std::distance(joints.begin(), it));
-      if (sum_wrapped_joint_states_)
+      if (i < joint_state_copy.position.size())
       {
-        sumRotationFromMinus2PiTo2Pi(latest_joint_state_.position[i], joint_states_[POSITION_INTERFACE_INDEX][j]);
+        if (sum_wrapped_joint_states_)
+        {
+          sumRotationFromMinus2PiTo2Pi(joint_state_copy.position[i], joint_states_[POSITION_INTERFACE_INDEX][j]);
+        }
+        else
+        {
+          joint_states_[POSITION_INTERFACE_INDEX][j] = joint_state_copy.position[i];
+        }
       }
-      else
+      if (i < joint_state_copy.velocity.size())
       {
-        joint_states_[POSITION_INTERFACE_INDEX][j] = latest_joint_state_.position[i];
+        joint_states_[VELOCITY_INTERFACE_INDEX][j] = joint_state_copy.velocity[i];
       }
-      if (!latest_joint_state_.velocity.empty())
+      if (i < joint_state_copy.effort.size())
       {
-        joint_states_[VELOCITY_INTERFACE_INDEX][j] = latest_joint_state_.velocity[i];
-      }
-      if (!latest_joint_state_.effort.empty())
-      {
-        joint_states_[EFFORT_INTERFACE_INDEX][j] = latest_joint_state_.effort[i];
+        joint_states_[EFFORT_INTERFACE_INDEX][j] = joint_state_copy.effort[i];
       }
     }
   }
@@ -277,24 +290,29 @@ hardware_interface::return_type TopicBasedSystem::write(const rclcpp::Time& /*ti
   }
 
   sensor_msgs::msg::JointState joint_state;
-  for (std::size_t i = 0; i < info_.joints.size(); ++i)
+  const auto num_joints = info_.joints.size();
+  joint_state.name.reserve(num_joints);
+  joint_state.position.resize(num_joints, std::numeric_limits<double>::quiet_NaN());
+  joint_state.velocity.resize(num_joints, std::numeric_limits<double>::quiet_NaN());
+  joint_state.effort.resize(num_joints, std::numeric_limits<double>::quiet_NaN());
+
+  for (std::size_t i = 0; i < num_joints; ++i)
   {
     joint_state.name.push_back(info_.joints[i].name);
-    joint_state.header.stamp = node_->now();
     // only send commands to the interfaces that are defined for this joint
     for (const auto& interface : info_.joints[i].command_interfaces)
     {
       if (interface.name == hardware_interface::HW_IF_POSITION)
       {
-        joint_state.position.push_back(joint_commands_[POSITION_INTERFACE_INDEX][i]);
+        joint_state.position[i] = joint_commands_[POSITION_INTERFACE_INDEX][i];
       }
       else if (interface.name == hardware_interface::HW_IF_VELOCITY)
       {
-        joint_state.velocity.push_back(joint_commands_[VELOCITY_INTERFACE_INDEX][i]);
+        joint_state.velocity[i] = joint_commands_[VELOCITY_INTERFACE_INDEX][i];
       }
       else if (interface.name == hardware_interface::HW_IF_EFFORT)
       {
-        joint_state.effort.push_back(joint_commands_[EFFORT_INTERFACE_INDEX][i]);
+        joint_state.effort[i] = joint_commands_[EFFORT_INTERFACE_INDEX][i];
       }
       else
       {
@@ -303,6 +321,7 @@ hardware_interface::return_type TopicBasedSystem::write(const rclcpp::Time& /*ti
       }
     }
   }
+  joint_state.header.stamp = node_->now();
 
   for (const auto& mimic_joint : mimic_joints_)
   {
